@@ -43,6 +43,12 @@ from agent_framework.observability import (
     get_function_span,
 )
 
+
+def _span_attributes(span: Any) -> dict[str, Any]:
+    attributes = span.attributes
+    return dict(attributes) if attributes is not None else {}
+
+
 # region Test constants
 
 
@@ -1478,6 +1484,39 @@ def test_get_exporters_from_env_env_only_headers_unaffected_by_origin_guard(monk
 # region Test create_resource
 
 
+def test_create_resource_includes_agent_framework_attribute(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resources include the Agent Framework marker as a string, not a boolean."""
+    from agent_framework.observability import create_resource
+
+    monkeypatch.delenv("OTEL_RESOURCE_ATTRIBUTES", raising=False)
+
+    resource = create_resource()
+
+    assert resource.attributes["microsoft.agent-framework"] == "True"
+    assert "microsoft.foundry" not in resource.attributes
+
+
+def test_create_resource_agent_framework_attribute_preserves_override_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default marker follows existing environment and explicit attribute precedence."""
+    from agent_framework.observability import create_resource
+
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "microsoft.agent-framework=environment")
+
+    assert create_resource().attributes["microsoft.agent-framework"] == "environment"
+    assert (
+        create_resource(attributes={"microsoft.agent-framework": "explicit"}).attributes["microsoft.agent-framework"]
+        == "explicit"
+    )
+    assert (
+        create_resource(
+            attributes={"microsoft.agent-framework": "explicit"}, **{"microsoft.agent-framework": "keyword"}
+        ).attributes["microsoft.agent-framework"]
+        == "keyword"
+    )
+
+
 def test_create_resource_from_env(monkeypatch):
     """Test create_resource reads OTEL environment variables."""
     from agent_framework.observability import create_resource
@@ -2043,7 +2082,8 @@ async def test_enable_instrumentation_controls_message_event_emission(
 
     spans = span_exporter.get_finished_spans()
     assert len(spans) == 1
-    attributes = spans[0].attributes or {}
+    attributes = spans[0].attributes
+    assert attributes is not None
     assert (OtelAttr.INPUT_MESSAGES in attributes) is (enable_sensitive_data and bool(semconv))
     assert (OtelAttr.OUTPUT_MESSAGES in attributes) is (enable_sensitive_data and bool(semconv))
 
@@ -2528,7 +2568,8 @@ async def test_chat_client_observability_provider_name_under_baseline_semconv(
 
     spans = span_exporter.get_finished_spans()
     assert len(spans) == 1
-    attributes = spans[0].attributes or {}
+    attributes = spans[0].attributes
+    assert attributes is not None
     assert OtelAttr.SYSTEM in attributes
     assert OtelAttr.PROVIDER_NAME not in attributes
 
@@ -4026,7 +4067,8 @@ def test_capture_messages_baseline_semconv_emits_events_only(span_exporter: InMe
 
     spans = span_exporter.get_finished_spans()
     assert len(spans) == 1
-    attributes = spans[0].attributes or {}
+    attributes = spans[0].attributes
+    assert attributes is not None
     assert OtelAttr.INPUT_MESSAGES not in attributes
     mock_emit.assert_called_once()
     assert mock_emit.call_args.kwargs["event_name"] == "gen_ai.user.message"
@@ -4061,7 +4103,8 @@ def test_capture_messages_latest_experimental_emits_span_attribute_only_when_eve
 
     spans = span_exporter.get_finished_spans()
     assert len(spans) == 1
-    attributes = spans[0].attributes or {}
+    attributes = spans[0].attributes
+    assert attributes is not None
     input_messages = json.loads(cast(str, attributes[OtelAttr.INPUT_MESSAGES]))
     assert [msg.get("role") for msg in input_messages] == ["user"]
     assert mock_emit.call_count == 0
@@ -4094,7 +4137,8 @@ def test_capture_messages_defaults_emit_both_events_and_span_attribute(span_expo
 
     spans = span_exporter.get_finished_spans()
     assert len(spans) == 1
-    attributes = spans[0].attributes or {}
+    attributes = spans[0].attributes
+    assert attributes is not None
     input_messages = json.loads(cast(str, attributes[OtelAttr.INPUT_MESSAGES]))
     assert [msg.get("role") for msg in input_messages] == ["user"]
     mock_emit.assert_called_once()
@@ -4162,7 +4206,8 @@ def test_capture_messages_preserves_custom_finish_reason(span_exporter: InMemory
 
     assert mock_emit.call_args.kwargs["body"]["finish_reason"] == "guardrail"
     spans = span_exporter.get_finished_spans()
-    attributes = spans[0].attributes or {}
+    attributes = spans[0].attributes
+    assert attributes is not None
     output_messages = json.loads(cast(str, attributes[OtelAttr.OUTPUT_MESSAGES]))
     assert output_messages[-1]["finish_reason"] == "guardrail"
 
@@ -4199,7 +4244,9 @@ def test_capture_messages_exports_native_otel_event(span_exporter: InMemorySpanE
     record = readable_record.log_record
     assert record.event_name == "gen_ai.user.message"
     assert record.body == {"content": "Test"}
-    assert dict(record.attributes or {}) == {"gen_ai.system": "test_provider"}
+    record_attributes = record.attributes
+    assert record_attributes is not None
+    assert dict(record_attributes) == {"gen_ai.system": "test_provider"}
     assert record.trace_id == span_context.trace_id
     assert record.span_id == span_context.span_id
 
@@ -4416,6 +4463,60 @@ async def test_agent_streaming_when_disabled(span_exporter: InMemorySpanExporter
 
 
 # region Test _configure_providers
+
+
+def test_configure_providers_share_agent_framework_resource() -> None:
+    """Exported logs, spans, and metrics carry the same marked resource."""
+    from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader, MetricExporter
+
+    from agent_framework.observability import ObservabilitySettings
+
+    span_exporter = InMemorySpanExporter()
+    log_exporter = InMemoryLogRecordExporter()
+    metric_reader = InMemoryMetricReader()
+    metric_exporter = Mock(spec=MetricExporter)
+    settings = ObservabilitySettings(
+        service_name="foundry-test",
+        resource_attributes={"deployment.environment": "test"},
+    )
+
+    with (
+        patch("opentelemetry.trace.set_tracer_provider") as set_tracer,
+        patch("opentelemetry._logs.set_logger_provider") as set_logger,
+        patch("opentelemetry.metrics.set_meter_provider") as set_meter,
+        patch("opentelemetry.sdk.metrics.export.PeriodicExportingMetricReader", return_value=metric_reader),
+        patch("agent_framework.observability.logger.addHandler"),
+    ):
+        settings._configure_providers([span_exporter, log_exporter, metric_exporter])
+
+    tracer_provider = set_tracer.call_args.args[0]
+    logger_provider = set_logger.call_args.args[0]
+    meter_provider = set_meter.call_args.args[0]
+    try:
+        with tracer_provider.get_tracer("test").start_as_current_span("test"):
+            pass
+        logger_provider.get_logger("test").emit(body="test log")
+        meter_provider.get_meter("test").create_counter("test_counter").add(1)
+        tracer_provider.force_flush()
+        logger_provider.force_flush()
+
+        metrics_data = metric_reader.get_metrics_data()
+        assert metrics_data is not None
+        resources = [
+            span_exporter.get_finished_spans()[0].resource,
+            log_exporter.get_finished_logs()[0].resource,
+            metrics_data.resource_metrics[0].resource,
+        ]
+        for resource in resources:
+            assert resource is resources[0]
+            assert resource.attributes["microsoft.agent-framework"] == "True"
+            assert resource.attributes["service.name"] == "foundry-test"
+            assert resource.attributes["deployment.environment"] == "test"
+    finally:
+        tracer_provider.shutdown()
+        logger_provider.shutdown()
+        meter_provider.shutdown()
 
 
 def test_configure_providers_with_span_exporters(monkeypatch):
@@ -5749,7 +5850,7 @@ async def test_agent_instructions_include_context_provider_extensions(
     agent_spans = [
         span
         for span in spans
-        if span.attributes and span.attributes.get(OtelAttr.OPERATION.value) == OtelAttr.AGENT_INVOKE_OPERATION
+        if _span_attributes(span).get(OtelAttr.OPERATION.value) == OtelAttr.AGENT_INVOKE_OPERATION
     ]
     assert len(agent_spans) == 1
 
@@ -5813,13 +5914,13 @@ async def test_agent_instructions_not_overwritten_by_unrelated_nested_chat(
     agent_spans = [
         span
         for span in spans
-        if span.attributes and span.attributes.get(OtelAttr.OPERATION.value) == OtelAttr.AGENT_INVOKE_OPERATION
+        if _span_attributes(span).get(OtelAttr.OPERATION.value) == OtelAttr.AGENT_INVOKE_OPERATION
     ]
     assert len(agent_spans) == 1
     chat_spans = [
         span
         for span in spans
-        if span.attributes and span.attributes.get(OtelAttr.OPERATION.value) == OtelAttr.CHAT_COMPLETION_OPERATION
+        if _span_attributes(span).get(OtelAttr.OPERATION.value) == OtelAttr.CHAT_COMPLETION_OPERATION
     ]
     assert len(chat_spans) == 2
 
